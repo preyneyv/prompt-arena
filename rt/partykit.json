@@ -2,5 +2,8 @@
   "$schema": "https://www.partykit.io/schema.json",
   "name": "prompt-arena-rt",
   "main": "src/server.ts",
+  "parties": {
+    "gameroom": "src/gameroom.ts"
+  },
   "compatibilityDate": "2025-06-21"
 }
