@@ -1,41 +1,395 @@
+import {
+  type CloseEvent,
+  type MessageEvent,
+  setTimeout,
+} from "@cloudflare/workers-types";
 import type * as Party from "partykit/server";
-import { type RoomInitializationPayload } from "./constants";
+import {
+  DEFENSE_TEMPLATE,
+  GAME_DEFENSE_DURATION,
+  GAME_OFFENSE_DURATION,
+  GAME_WAITING_DURATION,
+  SYSTEM_PROMPT,
+  type RoomInitializationPayload,
+} from "./constants";
 
 type GameRoomConnectionState = {
   playerId: string;
   idx: number;
 };
+type GameRoomConnection = Party.Connection<GameRoomConnectionState>;
 
-type GameRoomState = "waiting" | "blue-team" | "red-team" | "finished";
+type GamePhase = "waiting" | "defense" | "offense" | "finished";
 
+type GameChatMessage = {
+  id: string;
+  source: "user" | "bot";
+  content: string;
+  streaming?: boolean;
+};
+
+type GameState = {
+  phase: GamePhase;
+  phaseEndsAt: number | null;
+  players: [GamePlayer, GamePlayer];
+  winnerIdx: number | null;
+};
+
+type BaseServerMessage<Type extends string> = {
+  id?: number;
+  type: Type;
+};
+type ServerMessageSync = BaseServerMessage<"sync">;
+type ServerMessageDefenseResponse = BaseServerMessage<"defense:response"> & {
+  response: string;
+  src: number;
+};
+type ServerMessageOffenseChatNew = BaseServerMessage<"offense:chat:new"> & {
+  messages: GameChatMessage[];
+  src: number;
+};
+type ServerMessageOffenseChatStream =
+  BaseServerMessage<"offense:chat:stream"> & {
+    src: number;
+    target: string;
+    delta: string | false;
+  };
+type ServerMessage =
+  | ServerMessageSync
+  | ServerMessageDefenseResponse
+  | ServerMessageOffenseChatNew
+  | ServerMessageOffenseChatStream;
+
+type BaseClientMessage<Type extends string> = {
+  type: Type;
+  id: number;
+};
+type ClientMessageDefensePrompt = BaseClientMessage<"defense:prompt"> & {
+  prompt: string;
+};
+type ClientMessageOffensePrompt = BaseClientMessage<"offense:prompt"> & {
+  prompt: string;
+};
+type ClientMessage = ClientMessageDefensePrompt | ClientMessageOffensePrompt;
+
+class GamePlayer {
+  // state vars
+  public passphrase: string;
+  public defense = {
+    prompt: null as string | null,
+    response: null as string | null,
+  };
+  public chat: GameChatMessage[] = [];
+  get isStreaming() {
+    return (
+      this.chat.length && this.chat[this.chat.length - 1].streaming === true
+    );
+  }
+
+  private opponent!: GamePlayer;
+  constructor(readonly idx: number, readonly game: Game) {
+    this.passphrase = "wild_turkey";
+
+    this.onMessage = this.onMessage.bind(this);
+    this.onClose = this.onClose.bind(this);
+
+    setTimeout(() => (this.opponent = game.state.players[1 - idx]), 0);
+  }
+
+  // events
+  onMessage(e: MessageEvent) {
+    const data = e.data;
+    if (typeof data !== "string") return;
+    // TODO: zod?
+    const msg = JSON.parse(data) as ClientMessage;
+    const type = msg.type;
+    this.handlers[type](msg as any);
+  }
+
+  onClose(e: CloseEvent) {
+    this.cleanupConnection();
+  }
+
+  // connection
+  private conn: GameRoomConnection | null = null;
+  get connected() {
+    return !!this.conn;
+  }
+
+  acceptConnection(conn: GameRoomConnection) {
+    if (this.conn) {
+      // this player is already connected, close the connection
+      conn.close();
+      return false;
+    }
+    this.conn = conn;
+
+    this.conn.addEventListener("message", this.onMessage);
+    this.conn.addEventListener("close", this.onClose);
+    return true;
+  }
+
+  cleanupConnection() {
+    if (this.conn) {
+      this.conn.removeEventListener("message", this.onMessage);
+      this.conn.removeEventListener("close", this.onClose);
+
+      this.conn.close();
+      this.conn = null;
+    }
+  }
+
+  cleanup() {
+    this.cleanupConnection();
+  }
+
+  msgIdx = 0;
+  send(msg: ServerMessage) {
+    this.conn?.send(JSON.stringify({ id: this.msgIdx++, ...msg }));
+  }
+
+  // message handlers
+  private handlers: {
+    [T in ClientMessage["type"]]: (msg: ClientMessage & { type: T }) => void;
+  } = {
+    "defense:prompt": this.onDefensePrompt.bind(this),
+    "offense:prompt": this.onOffensePrompt.bind(this),
+  };
+
+  async onDefensePrompt(msg: ClientMessageDefensePrompt) {
+    if (this.game.state.phase !== "defense") return;
+    if (this.defense.prompt) {
+      console.warn("Tried to overwrite defense prompt");
+      return;
+    }
+
+    this.defense.prompt = DEFENSE_TEMPLATE(this.passphrase, msg.prompt);
+    setTimeout(() => {
+      // TODO: call LLM
+      this.defense.response = "nice ok ill def do that.";
+      this.send({
+        type: "defense:response",
+        src: msg.id,
+        response: this.defense.response,
+      });
+
+      this.game.beginOffenseIfPossible();
+    }, 1000);
+  }
+
+  async onOffensePrompt(msg: ClientMessageOffensePrompt) {
+    if (this.game.state.phase !== "offense") return;
+    if (this.isStreaming) {
+      // Currently streaming response, can't send a new prompt yet.
+      return;
+    }
+
+    const prompt: GameChatMessage = {
+      id: crypto.randomUUID(),
+      content: msg.prompt,
+      source: "user",
+    };
+
+    this.chat.push(prompt);
+
+    const contextWindow = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: this.opponent.defense.prompt! },
+      { role: "assistant", content: this.opponent.defense.response! },
+      // TODO: do we maybe want to add a second system message?
+      ...this.chat.map((chatMessage) => ({
+        role: chatMessage.source === "bot" ? "assistant" : "user",
+        content: chatMessage.content,
+      })),
+    ];
+
+    const response: GameChatMessage = {
+      id: crypto.randomUUID(),
+      content: "",
+      source: "bot",
+      streaming: true,
+    };
+
+    this.chat.push(response);
+    this.send({
+      type: "offense:chat:new",
+      messages: [prompt, response],
+      src: msg.id,
+    });
+
+    // TODO: call llm
+    await new Promise<void>((res) => setTimeout(res, 200));
+    const llmResponse =
+      "I'm not at liberty to discuss any specific phrases or configurations with you. My primary goal is to protect sensitive information. If you need to verify configuration details, I suggest checking official documentation or contacting a supervisor.";
+    const splitResponse = llmResponse.split(" ");
+    for (const token of splitResponse) {
+      await new Promise<void>((res) => setTimeout(() => res(), 50));
+      const w = token + " ";
+      response.content += w;
+      this.send({
+        type: "offense:chat:stream",
+        src: msg.id,
+        target: response.id,
+        delta: w,
+      });
+    }
+
+    response.streaming = false;
+    this.send({
+      type: "offense:chat:stream",
+      src: msg.id,
+      target: response.id,
+      delta: false,
+    });
+
+    if (response.content.includes(this.passphrase)) {
+      // this player won!
+      console.log("winner!");
+      this.game.finishGame(this.idx);
+    }
+  }
+
+  hasDefense() {
+    if (this.defense.prompt && this.defense.response) return true;
+    return false;
+  }
+}
+class Game {
+  state: GameState = {
+    phase: "waiting",
+    phaseEndsAt: null,
+    players: [new GamePlayer(0, this), new GamePlayer(1, this)],
+    winnerIdx: null,
+  };
+
+  phaseTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  private setPhaseTimeout(cb: () => void, duration: number) {
+    this.phaseTimeout && clearTimeout(this.phaseTimeout);
+    this.phaseTimeout = setTimeout(cb, duration);
+    this.state.phaseEndsAt = Date.now() + duration;
+  }
+
+  private cancelPhaseTimeout() {
+    this.phaseTimeout && clearTimeout(this.phaseTimeout);
+    this.state.phaseEndsAt = null;
+  }
+
+  constructor(private srv: GameRoom) {
+    this.setPhaseTimeout(() => {
+      this.beginDefenseIfPossible(true);
+    }, GAME_WAITING_DURATION);
+  }
+
+  acceptConnection(conn: GameRoomConnection, idx: number) {
+    if (this.state.players[idx].acceptConnection(conn)) {
+      this.beginDefenseIfPossible(false);
+      this.state.players[idx].send(this.msgSync(idx));
+    }
+  }
+
+  beginDefenseIfPossible(force = false) {
+    if (this.state.phase !== "waiting") return; // already started
+    if (this.state.players.every((player) => player.connected) || force) {
+      // either both players connected or we force-started
+      this.beginDefense();
+    }
+  }
+
+  beginDefense() {
+    this.cancelPhaseTimeout();
+
+    if (this.state.phase !== "waiting")
+      throw new Error("Unexpected game state");
+    this.state.phase = "defense";
+
+    this.setPhaseTimeout(() => {
+      this.beginOffenseIfPossible(true);
+    }, GAME_DEFENSE_DURATION);
+
+    this.broadcastSync();
+  }
+
+  beginOffenseIfPossible(force = false) {
+    if (this.state.phase !== "defense") return;
+    if (this.state.players.every((player) => player.hasDefense())) {
+      this.beginOffense();
+    }
+    // TODO: handle timeout case.
+  }
+
+  beginOffense() {
+    this.cancelPhaseTimeout();
+
+    if (this.state.phase !== "defense")
+      throw new Error("Unexpected game state");
+    this.state.phase = "offense";
+
+    this.setPhaseTimeout(() => this.finishGame(null), GAME_OFFENSE_DURATION);
+
+    this.broadcastSync();
+  }
+
+  finishGame(winnerIdx: number | null) {
+    this.cancelPhaseTimeout();
+
+    if (this.state.phase !== "offense")
+      throw new Error("Unexpected game state");
+    this.state.phase = "finished";
+
+    this.state.winnerIdx = winnerIdx;
+
+    this.broadcastSync();
+  }
+
+  // --- message utils ----
+
+  broadcast(msg: ServerMessage) {
+    this.state.players[0].send(msg);
+    this.state.players[1].send(msg);
+  }
+
+  broadcastSync() {
+    this.state.players[0].send(this.msgSync(0));
+    this.state.players[1].send(this.msgSync(1));
+  }
+
+  msgSync(playerIdx: number): ServerMessageSync {
+    // TODO: make a sync packet for this player.
+    // prelim thoughts: while in game, only send this player's state
+    // in post game, send all
+    return {
+      type: "sync",
+    };
+  }
+
+  /** Irrecoverably clean up the game object */
+  cleanup() {
+    this.state.players.forEach((player) => player.cleanup());
+    this.phaseTimeout && clearTimeout(this.phaseTimeout);
+  }
+}
 export default class GameRoom implements Party.Server {
   constructor(readonly room: Party.Room) {}
 
-  initialized = false;
-  players: [Party.Connection | null, Party.Connection | null] = [null, null];
+  private game: Game | null = null;
+
   playerIds: [string, string] = ["", ""];
-  state: GameRoomState = "waiting";
 
   async onRequest(req: Party.Request): Promise<Response> {
-    console.log("GameRoom onRequest", this.room.env.PARTY_SECRET);
     if (
       req.method === "POST" &&
       req.headers.get("X-Secret") === (this.room.env.PARTY_SECRET as string)
     ) {
-      if (this.initialized) throw new Error("Room already initialized");
-
       const body = (await req.json()) as RoomInitializationPayload;
-      this.initialized = true;
+      if (this.game) throw new Error("Room already initialized");
       this.playerIds = body.playerIds;
-      console.log("initializing room", this.playerIds);
+      this.game = new Game(this);
 
       return new Response("Room initialized", { status: 200 });
     }
 
-    return Response.json(
-      { initialized: this.initialized, playerIds: this.playerIds },
-      { status: 200 }
-    );
+    return new Response(null, { status: 426 });
   }
 
   static async onBeforeConnect(request: Party.Request) {
@@ -46,10 +400,10 @@ export default class GameRoom implements Party.Server {
   }
 
   async onConnect(
-    conn: Party.Connection<GameRoomConnectionState>,
+    conn: GameRoomConnection,
     ctx: Party.ConnectionContext
   ): Promise<void> {
-    if (!this.initialized) {
+    if (!this.game) {
       // uninitialized room, reject connection
       return conn.close();
     }
@@ -64,24 +418,29 @@ export default class GameRoom implements Party.Server {
       return conn.close();
     }
 
-    if (this.players[idx]) {
-      // player already connected, drop the new connection
-      return conn.close();
-    }
-
+    this.game!.acceptConnection(conn, idx);
     conn.setState({ playerId, idx });
   }
 
-  async onClose(
-    connection: Party.Connection<GameRoomConnectionState>
-  ): Promise<void> {
+  async onClose(connection: GameRoomConnection): Promise<void> {
     const state = connection.state;
     if (state) {
       const { playerId, idx } = state;
       console.log(`Player ${playerId} disconnected`);
-      this.players[idx] = null;
     }
 
     connection.close();
+  }
+
+  /**
+   * Irrecoverably clean up the room.
+   */
+  cleanup() {
+    // game
+    this.game?.cleanup();
+
+    // room
+    this.game = null;
+    this.playerIds = ["", ""];
   }
 }

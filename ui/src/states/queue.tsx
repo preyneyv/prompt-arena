@@ -29,11 +29,12 @@ function useMatchmaker({
     };
 
     const onClose = (e: CloseEvent) => {
+      setStatus("disconnected");
       if (e.wasClean) {
         // don't reconnect if the close was clean
         ws.close();
       }
-      setStatus("disconnected");
+      setStatus(ws.shouldReconnect ? "connecting" : "disconnected");
     };
 
     const onError = (error: ErrorEvent) => {
@@ -102,7 +103,7 @@ export default function Queue() {
           mm.disconnect();
         }
       }}
-      disabled={mm.status === "connecting"}
+      // disabled={mm.status === "connecting"}
     >
       {mm.status === "disconnected" && "Join Queue"}
       {mm.status === "connecting" && "Joining..."}
