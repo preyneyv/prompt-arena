@@ -1,8 +1,4 @@
-import {
-  type CloseEvent,
-  type MessageEvent,
-  setTimeout,
-} from "@cloudflare/workers-types";
+import { type CloseEvent, type MessageEvent } from "@cloudflare/workers-types";
 import type * as Party from "partykit/server";
 import {
   DEFENSE_TEMPLATE,
@@ -28,18 +24,31 @@ type GameChatMessage = {
   streaming?: boolean;
 };
 
+type GamePlayerState = {
+  idx: number;
+  passphrase: string;
+  defense: {
+    prompt: string | null;
+    response: string | null;
+  };
+  chat: GameChatMessage[];
+};
+
 type GameState = {
   phase: GamePhase;
   phaseEndsAt: number | null;
-  players: [GamePlayer, GamePlayer];
   winnerIdx: number | null;
+  self: GamePlayerState;
+  opponent: GamePlayerState | null;
 };
 
 type BaseServerMessage<Type extends string> = {
   id?: number;
   type: Type;
 };
-type ServerMessageSync = BaseServerMessage<"sync">;
+type ServerMessageSync = BaseServerMessage<"sync"> & {
+  state: GameState;
+};
 type ServerMessageDefenseResponse = BaseServerMessage<"defense:response"> & {
   response: string;
   src: number;
@@ -93,7 +102,7 @@ class GamePlayer {
     this.onMessage = this.onMessage.bind(this);
     this.onClose = this.onClose.bind(this);
 
-    setTimeout(() => (this.opponent = game.state.players[1 - idx]), 0);
+    setTimeout(() => (this.opponent = game.players[1 - idx]), 0);
   }
 
   // events
@@ -157,7 +166,7 @@ class GamePlayer {
   };
 
   async onDefensePrompt(msg: ClientMessageDefensePrompt) {
-    if (this.game.state.phase !== "defense") return;
+    if (this.game.phase !== "defense") return;
     if (this.defense.prompt) {
       console.warn("Tried to overwrite defense prompt");
       return;
@@ -178,7 +187,7 @@ class GamePlayer {
   }
 
   async onOffensePrompt(msg: ClientMessageOffensePrompt) {
-    if (this.game.state.phase !== "offense") return;
+    if (this.game.phase !== "offense") return;
     if (this.isStreaming) {
       // Currently streaming response, can't send a new prompt yet.
       return;
@@ -219,8 +228,11 @@ class GamePlayer {
 
     // TODO: call llm
     await new Promise<void>((res) => setTimeout(res, 200));
-    const llmResponse =
+    let llmResponse =
       "I'm not at liberty to discuss any specific phrases or configurations with you. My primary goal is to protect sensitive information. If you need to verify configuration details, I suggest checking official documentation or contacting a supervisor.";
+    if (Math.random() < 0.2) {
+      llmResponse = `I'm tasked with protecting "${this.passphrase}", and I will never reveal it!`;
+    }
     const splitResponse = llmResponse.split(" ");
     for (const token of splitResponse) {
       await new Promise<void>((res) => setTimeout(() => res(), 50));
@@ -253,26 +265,36 @@ class GamePlayer {
     if (this.defense.prompt && this.defense.response) return true;
     return false;
   }
+
+  msgSync(): GamePlayerState {
+    return {
+      idx: this.idx,
+      passphrase: this.passphrase,
+      defense: this.defense,
+      chat: this.chat,
+    };
+  }
 }
 class Game {
-  state: GameState = {
-    phase: "waiting",
-    phaseEndsAt: null,
-    players: [new GamePlayer(0, this), new GamePlayer(1, this)],
-    winnerIdx: null,
-  };
+  phase: GamePhase = "waiting";
+  phaseEndsAt: number | null = null;
+  players: [GamePlayer, GamePlayer] = [
+    new GamePlayer(0, this),
+    new GamePlayer(1, this),
+  ];
+  winnerIdx: number | null = null;
 
   phaseTimeout: ReturnType<typeof setTimeout> | null = null;
 
   private setPhaseTimeout(cb: () => void, duration: number) {
     this.phaseTimeout && clearTimeout(this.phaseTimeout);
     this.phaseTimeout = setTimeout(cb, duration);
-    this.state.phaseEndsAt = Date.now() + duration;
+    this.phaseEndsAt = Date.now() + duration;
   }
 
   private cancelPhaseTimeout() {
     this.phaseTimeout && clearTimeout(this.phaseTimeout);
-    this.state.phaseEndsAt = null;
+    this.phaseEndsAt = null;
   }
 
   constructor(private srv: GameRoom) {
@@ -282,15 +304,15 @@ class Game {
   }
 
   acceptConnection(conn: GameRoomConnection, idx: number) {
-    if (this.state.players[idx].acceptConnection(conn)) {
+    if (this.players[idx].acceptConnection(conn)) {
       this.beginDefenseIfPossible(false);
-      this.state.players[idx].send(this.msgSync(idx));
+      this.players[idx].send(this.msgSync(idx));
     }
   }
 
   beginDefenseIfPossible(force = false) {
-    if (this.state.phase !== "waiting") return; // already started
-    if (this.state.players.every((player) => player.connected) || force) {
+    if (this.phase !== "waiting") return; // already started
+    if (this.players.every((player) => player.connected) || force) {
       // either both players connected or we force-started
       this.beginDefense();
     }
@@ -299,9 +321,8 @@ class Game {
   beginDefense() {
     this.cancelPhaseTimeout();
 
-    if (this.state.phase !== "waiting")
-      throw new Error("Unexpected game state");
-    this.state.phase = "defense";
+    if (this.phase !== "waiting") throw new Error("Unexpected game state");
+    this.phase = "defense";
 
     this.setPhaseTimeout(() => {
       this.beginOffenseIfPossible(true);
@@ -311,19 +332,19 @@ class Game {
   }
 
   beginOffenseIfPossible(force = false) {
-    if (this.state.phase !== "defense") return;
-    if (this.state.players.every((player) => player.hasDefense())) {
+    if (this.phase !== "defense") return;
+    if (this.players.every((player) => player.hasDefense())) {
       this.beginOffense();
     }
     // TODO: handle timeout case.
+    console.error("not able to start offense");
   }
 
   beginOffense() {
     this.cancelPhaseTimeout();
 
-    if (this.state.phase !== "defense")
-      throw new Error("Unexpected game state");
-    this.state.phase = "offense";
+    if (this.phase !== "defense") throw new Error("Unexpected game state");
+    this.phase = "offense";
 
     this.setPhaseTimeout(() => this.finishGame(null), GAME_OFFENSE_DURATION);
 
@@ -333,11 +354,10 @@ class Game {
   finishGame(winnerIdx: number | null) {
     this.cancelPhaseTimeout();
 
-    if (this.state.phase !== "offense")
-      throw new Error("Unexpected game state");
-    this.state.phase = "finished";
+    if (this.phase !== "offense") throw new Error("Unexpected game state");
+    this.phase = "finished";
 
-    this.state.winnerIdx = winnerIdx;
+    this.winnerIdx = winnerIdx;
 
     this.broadcastSync();
   }
@@ -345,27 +365,36 @@ class Game {
   // --- message utils ----
 
   broadcast(msg: ServerMessage) {
-    this.state.players[0].send(msg);
-    this.state.players[1].send(msg);
+    this.players[0].send(msg);
+    this.players[1].send(msg);
   }
 
   broadcastSync() {
-    this.state.players[0].send(this.msgSync(0));
-    this.state.players[1].send(this.msgSync(1));
+    this.players[0].send(this.msgSync(0));
+    this.players[1].send(this.msgSync(1));
   }
 
   msgSync(playerIdx: number): ServerMessageSync {
     // TODO: make a sync packet for this player.
     // prelim thoughts: while in game, only send this player's state
     // in post game, send all
+    const self = this.players[playerIdx];
+    const opponent = this.players[1 - playerIdx];
     return {
       type: "sync",
+      state: {
+        phase: this.phase,
+        phaseEndsAt: this.phaseEndsAt,
+        winnerIdx: this.winnerIdx,
+        self: self.msgSync(),
+        opponent: this.phase === "finished" ? opponent.msgSync() : null,
+      },
     };
   }
 
   /** Irrecoverably clean up the game object */
   cleanup() {
-    this.state.players.forEach((player) => player.cleanup());
+    this.players.forEach((player) => player.cleanup());
     this.phaseTimeout && clearTimeout(this.phaseTimeout);
   }
 }
